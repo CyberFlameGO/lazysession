@@ -7,7 +7,6 @@ package gocui
 import (
 	"bytes"
 	"io"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -109,30 +108,6 @@ type View struct {
 	Context string // this is for assigning keybindings to a view only in certain contexts
 
 	log *logrus.Entry
-
-	// Pty tells us whether we have a pty running within the view. When Pty is set,
-	// we will catch keybindings set on the view, but all other keypresses (including
-	// those for which there are global keybindings) will be forwarded to the
-	// underlying pty as the original byte string. When Pty is set, we will also
-	// directly redraw the view when it is written to
-	Pty bool
-
-	// StdinWriter is used in conjunction with the Pty flag. When using a pty,
-	// any termbox events not caught by the view will be written to this writer
-	// as the original byte slice.
-	StdinWriter io.Writer
-
-	// these are for when the terminal wants to save the cursor position to restore
-	// it later
-	savedCx    int
-	savedCy    int
-	savedLines [][]cell // TODO: see if we need a separate savedCx and savedCy for dealing with code 1049
-	savedOx    int
-	savedOy    int
-
-	// these are the top and bottom scroll margins
-	topMargin    int
-	bottomMargin int
 }
 
 type viewLine struct {
@@ -159,18 +134,16 @@ func (l lineType) String() string {
 // newView returns a new View object.
 func newView(name string, x0, y0, x1, y1 int, mode OutputMode, log *logrus.Entry) *View {
 	v := &View{
-		name:         name,
-		x0:           x0,
-		y0:           y0,
-		x1:           x1,
-		y1:           y1,
-		Frame:        true,
-		Editor:       DefaultEditor,
-		tainted:      true,
-		ei:           newEscapeInterpreter(mode),
-		log:          log,
-		topMargin:    1,
-		bottomMargin: y1 - y0, // TODO: this might be off by one
+		name:    name,
+		x0:      x0,
+		y0:      y0,
+		x1:      x1,
+		y1:      y1,
+		Frame:   true,
+		Editor:  DefaultEditor,
+		tainted: true,
+		ei:      newEscapeInterpreter(mode),
+		log:     log,
 	}
 	return v
 }
@@ -230,10 +203,10 @@ func (v *View) setRune(x, y int, ch rune, fgColor, bgColor Attribute) error {
 // SetCursor sets the cursor position of the view at the given point,
 // relative to the view. It checks if the position is valid.
 func (v *View) SetCursor(x, y int) error {
-	if x < 0 || y < 0 {
+	maxX, maxY := v.Size()
+	if x < 0 || x >= maxX || y < 0 || y >= maxY {
 		return nil
 	}
-	v.log.Warn("in set cursor, x: ", x)
 	v.cx = x
 	v.cy = y
 	return nil
@@ -260,102 +233,6 @@ func (v *View) Origin() (x, y int) {
 	return v.ox, v.oy
 }
 
-func (v *View) padCellsForNewCy() {
-	if v.cx >= len(v.lines[v.cy]) {
-		v.lines[v.cy] = append(v.lines[v.cy], make([]cell, v.cx-len(v.lines[v.cy]))...)
-	}
-}
-
-func (v *View) moveCursorHorizontally(n int) {
-	if n > 0 {
-		v.moveCursorRight(n)
-		return
-	}
-	v.moveCursorLeft(-n)
-}
-
-func (v *View) moveCursorVertically(n int) {
-	if n > 0 {
-		v.moveCursorDown(n)
-		return
-	}
-	v.moveCursorUp(-n)
-}
-
-func (v *View) moveCursorRight(n int) {
-	for i := 0; i < n; i++ {
-		if v.cx == len(v.lines[v.cy]) {
-			v.lines[v.cy] = append(v.lines[v.cy], cell{})
-		}
-		v.cx++
-	}
-}
-
-func (v *View) moveCursorLeft(n int) {
-	v.log.Warn("moving cursor left, v.cx: ", v.cx, ", n: ", n)
-	if v.cx-n <= 0 {
-		v.cx = 0
-	} else {
-		v.cx -= n
-	}
-}
-
-func (v *View) moveCursorDown(n int) {
-	for i := 0; i < n; i++ {
-		if v.cy == len(v.lines)-1 {
-			v.lines = append(v.lines, nil)
-		}
-		v.cy++
-	}
-	v.padCellsForNewCy()
-}
-
-func (v *View) moveCursorUp(n int) {
-	if v.cy-n <= 0 {
-		v.cy = 0
-	} else {
-		v.cy -= n
-	}
-	v.padCellsForNewCy()
-}
-
-func (v *View) moveCursorToPosition(x int, y int) {
-	// v.log.Warn("x: ", x)
-	// v.log.Warn("y: ", y)
-	v.moveCursorVertically(y - v.cy)
-	// v.log.Warn("after moving vertically: y: ", v.cy, ", x: ", v.cx, ", line length: ", len(v.lines[v.cy]))
-	v.moveCursorHorizontally(x - v.cx)
-	// v.log.Warn("after moving horizontally: y: ", v.cy, ", x: ", v.cx, ", line length: ", len(v.lines[v.cy]))
-}
-
-func quoteRunes(runes []rune) string {
-	str := ""
-	for _, r := range runes {
-		str += strconv.QuoteRune(r)
-	}
-	return str
-}
-
-func insertLine(lines [][]cell, line []cell, index int) [][]cell {
-	// TODO: handle padding
-	lines = append(lines, nil)
-	copy(lines[index+1:], lines[index:])
-	lines[index] = line
-	return lines
-}
-
-func deleteLine(lines [][]cell, index int) [][]cell {
-	if len(lines) < index {
-		return lines
-	}
-	if index < len(lines)-1 {
-		copy(lines[index:], lines[index+1:])
-	}
-	lines[len(lines)-1] = nil
-	lines = lines[:len(lines)-1]
-	return lines
-}
-
 // Write appends a byte slice into the view's internal buffer. Because
 // View implements the io.Writer interface, it can be passed as parameter
 // of functions like fmt.Fprintf, fmt.Fprintln, io.Copy, etc. Clear must
@@ -366,257 +243,93 @@ func (v *View) Write(p []byte) (n int, err error) {
 	defer v.writeMutex.Unlock()
 
 	if len(v.lines) == 0 {
-		v.lines = [][]cell{[]cell{cell{}}}
+		v.lines = make([][]cell, 1) // not sure why we're doing that
 	}
 
-	sanityCheck := func() {
-		if v.lines == nil {
-			v.log.Warn("FAILED! v.lines == nil")
-			panic("v.lines == nil")
-		}
-		if v.cx > len(v.lines[v.cy]) {
-			v.log.Warn("FAILED! y: ", v.cy, ", x: ", v.cx, ", line length: ", len(v.lines[v.cy]))
-			panic("cx too big")
-		}
-	}
-
-	runes := bytes.Runes(p)
-	// v.log.Warn(quoteRunes(runes))
-	for _, ch := range runes {
+	for _, ch := range bytes.Runes(p) {
 		switch ch {
 		case '\n':
-			v.log.Warn("newline")
-			v.cx = 0
-			v.cy += 1
-			if v.cy == len(v.lines) {
-				v.lines = append(v.lines, []cell{})
-			} else if v.cy == v.bottomMargin {
-				v.lines = deleteLine(v.lines, v.topMargin-1)
-				v.lines = insertLine(v.lines, []cell{}, v.bottomMargin-1)
+			if v.cy == len(v.lines)-1 {
+				v.lines = append(v.lines, nil)
 			}
-			sanityCheck()
+			v.cy += 1
+			v.cx = 0
 		case '\r':
-			v.log.Warn("carriage return")
 			if v.IgnoreCarriageReturns {
 				continue
 			}
 			v.cx = 0
-
-			sanityCheck()
 		default:
-
 			cells := v.parseInput(ch)
 			if v.ei.instruction.kind != NONE {
 				switch v.ei.instruction.kind {
 				case CURSOR_UP:
 					toMoveUp := v.ei.instruction.param1
-					v.log.Warn("moving cursor up by ", toMoveUp)
-					v.moveCursorUp(toMoveUp)
-					sanityCheck()
+					// if we are already in the top line there's nothing we can do: so continue
+					if v.cy-toMoveUp <= 0 {
+						v.cy = 0
+					} else {
+						v.cy -= toMoveUp
+					}
 				case CURSOR_DOWN:
 					toMoveDown := v.ei.instruction.param1
-					v.log.Warn("moving cursor down by ", toMoveDown)
-					v.moveCursorDown(toMoveDown)
-					sanityCheck()
+					for i := 0; i < toMoveDown; i++ {
+						if v.cy == len(v.lines)-1 {
+							v.lines = append(v.lines, nil)
+						}
+						v.cy++
+					}
 
 				case CURSOR_LEFT:
 					toMoveLeft := v.ei.instruction.param1
-					v.log.Warn("moving cursor left: ", toMoveLeft)
-					v.moveCursorLeft(toMoveLeft)
-					sanityCheck()
+					if v.cx-toMoveLeft <= 0 {
+						v.cx = 0
+					} else {
+						v.cx -= toMoveLeft
+					}
 				case CURSOR_RIGHT:
 					toMoveRight := v.ei.instruction.param1
-					v.log.Warn("moving cursor right by ", toMoveRight)
-					v.moveCursorRight(toMoveRight)
-					sanityCheck()
-				case CURSOR_MOVE:
-					y := v.ei.instruction.param1
-					x := v.ei.instruction.param2
-					// these params are 1-indexed so we need to decrement them (0 is left alone)
-					if x > 0 {
-						x--
+					for i := 0; i < toMoveRight; i++ {
+						if v.cx == len(v.lines[v.cy]) {
+							v.lines[v.cy] = append(v.lines[v.cy], cell{})
+						}
+						v.cx++
 					}
-					if y > 0 {
-						y--
-					}
-
-					v.moveCursorToPosition(x, y)
-					sanityCheck()
-				case ERASE_IN_LINE:
-					code := v.ei.instruction.param1
-					// need to check if we should delete the character at the cursor as well. I will assume that we don't (cos it's easier code-wise)
-					switch code {
-					case 0:
-						v.log.Warn("line length:", len(v.lines[v.cy]))
-						v.log.Warn("cx:", v.cx)
-						v.lines[v.cy] = v.lines[v.cy][0:v.cx]
-						sanityCheck()
-					case 1:
-						v.lines[v.cy] = append(make([]cell, v.cx), v.lines[v.cy][v.cx:]...)
-						sanityCheck()
-					case 2:
-						// need to clear line but retain cursor x position
-						// so we'll pad everything out to the left
-						v.lines[v.cy] = make([]cell, v.cx+1)
-						sanityCheck()
-					}
-
+				case ERASE_TO_END_OF_LINE:
+					v.lines[v.cy] = v.lines[v.cy][0:v.cx]
 				case CLEAR_SCREEN:
-					v.log.Warn("clearing screen")
-					code := v.ei.instruction.param1
-
-					switch code {
-					case 0:
-						// erase from current position to end of screen, left to right and up to down
-						v.lines[v.cy] = v.lines[v.cy][0:v.cx]
-						v.lines[v.cy] = append(v.lines[v.cy], cell{})
-						if len(v.lines)-1 > v.cy {
-							v.lines = v.lines[:v.cy+1]
-						}
-						sanityCheck()
-					case 1:
-						// TODO: test
-						if v.cy > 0 {
-							v.lines = append(make([][]cell, v.cy), v.lines[v.cy:]...)
-						}
-						v.lines[v.cy] = append(make([]cell, v.cx), v.lines[v.cy][v.cx:]...)
-						sanityCheck()
-					case 2:
-						v.lines = make([][]cell, 1)
-						// TODO: apparently the cursor isn't actually supposed to move here. We'll need to pad this out.
-						v.cx = 0
-						v.cy = 0
-						v.ox = 0
-						v.oy = 0
-						sanityCheck()
-					}
-
-				case INSERT_CHARACTER:
-					v.log.Warn("inserting character")
-					toInsert := v.ei.instruction.param1
-					if toInsert == 0 {
-						toInsert = 1
-					}
-					v.lines[v.cy] = append(v.lines[v.cy][:v.cx], append(make([]cell, toInsert), v.lines[v.cy][v.cx:]...)...)
-				case DELETE:
-					v.log.Warn("deleting characters")
-					toDelete := v.ei.instruction.param1
-					if toDelete == 0 {
-						toDelete = 1
-					}
-					if v.cx+toDelete > len(v.lines[v.cy]) {
-						toDelete = len(v.lines[v.cy]) - v.cx
-					}
-					v.lines[v.cy] = append(v.lines[v.cy][:v.cx], v.lines[v.cy][v.cx+toDelete:]...)
-				case SAVE_CURSOR_POSITION:
-					v.log.Warn("saving cursor position")
-					v.savedCx = v.cx
-					v.savedCy = v.cy
-				case RESTORE_CURSOR_POSITION:
-					v.log.Warn("restoring cursor position")
-					v.moveCursorToPosition(v.savedCx, v.savedCy)
-					sanityCheck()
-				case WRITE:
-					v.log.Warn("writing")
-					v.StdinWriter.Write([]byte(string(v.ei.instruction.toWrite)))
-				case SWITCH_TO_ALTERNATE_SCREEN:
-					v.log.Warn("switching to alternate screen")
-					v.savedLines = v.lines
-					v.lines = [][]cell{[]cell{cell{}}}
-					v.savedCx = v.cx
-					v.savedCy = v.cy
-					v.savedOx = v.ox
-					v.savedOy = v.oy
-					v.cy = 0
+					v.lines = make([][]cell, 1)
 					v.cx = 0
-					v.oy = 0
-					v.ox = 0
-					v.Autoscroll = false
-					sanityCheck()
-				case SWITCH_BACK_FROM_ALTERNATE_SCREEN:
-					v.log.Warn("switching back from alternate screen")
-					v.lines = v.savedLines
-					v.topMargin = 1
-					v.bottomMargin = v.y1 - v.y0
-					v.cx = v.savedCx
-					v.cy = v.savedCy
-					v.ox = v.savedOx
-					v.oy = v.savedOy
-					v.Autoscroll = true
-				case SET_SCROLL_MARGINS:
-					v.log.Warn("setting scroll margins")
-					v.topMargin = v.ei.instruction.param1
-					v.bottomMargin = v.ei.instruction.param2
-				case INSERT_LINES:
-					v.log.Warn("inserting lines, v.cy: ", v.cy, ", v.topMargin: ", v.topMargin, ", v.bottomMargin: ", v.bottomMargin, ", len(v.lines): ", len(v.lines))
-					if v.cy+1 < v.topMargin || v.cy+1 > v.bottomMargin {
-						continue
-					}
-					for i := 0; i < v.ei.instruction.param1; i++ {
-						if len(v.lines) >= v.bottomMargin {
-							v.lines = deleteLine(v.lines, v.bottomMargin-1)
-						}
-
-						v.lines = insertLine(v.lines, []cell{}, v.cy)
-					}
-					sanityCheck()
-				case DELETE_LINES:
-					v.log.Warn("deleting lines, v.cy: ", v.cy, ", v.topMargin: ", v.topMargin, ", v.bottomMargin: ", v.bottomMargin, ", len(v.lines): ", len(v.lines))
-
-					if v.cy+1 < v.topMargin || v.cy+1 > v.bottomMargin {
-						continue
-					}
-					for i := 0; i < v.ei.instruction.param1; i++ {
-						v.lines = insertLine(v.lines, []cell{}, v.bottomMargin-1)
-						v.lines = deleteLine(v.lines, v.cy)
-					}
-					sanityCheck()
+					v.cy = 0
 				default:
 					panic("instruction not understood")
 				}
 				v.ei.instructionRead()
-				continue
 			}
 			if cells == nil {
 				continue
 			}
 
-			for _, c := range cells {
-				if c.chr == 7 {
-					// bell: can't do anything
-					continue
-				}
-				if c.chr == '\b' {
+			if len(v.lines[v.cy]) == 0 {
+				v.lines[v.cy] = append(v.lines[v.cy], cell{})
+			}
+			for _, cell := range cells {
+				if cell.chr == 8 {
 					if v.cx > 0 {
 						v.cx--
+						v.lines[v.cy] = v.lines[v.cy][0 : len(v.lines[v.cy])-1]
 					}
 					continue
 				}
-				if v.cx == len(v.lines[v.cy]) {
-					v.lines[v.cy] = append(v.lines[v.cy], c)
-				} else if v.cx < len(v.lines[v.cy]) {
-					v.lines[v.cy][v.cx] = c
+				if v.cx == len(v.lines[v.cy])-1 {
+					v.lines[v.cy] = append(v.lines[v.cy], cell)
+				} else if v.cx < len(v.lines[v.cy])-1 {
+					v.lines[v.cy][v.cx] = cell
 				} else {
-					// TODO: decide whether this matters
-					v.log.Warn("y: ", v.cy, ", x: ", v.cx, ", line length: ", len(v.lines[v.cy]), ", cell ch: ", c.chr)
 					panic(v.name + ": above length for some reason")
 				}
 
 				v.cx++
-
-				// TODO: put this behind a flag. We wouldn't want to use it for
-				// pure logs because we can't get the original line back when we resize
-				width, _ := v.Size()
-				if v.cx == width {
-					v.moveCursorDown(1)
-					v.cx = 0
-				}
-			}
-			sanityCheck()
-
-			_, height := v.Size()
-			if v.cy >= height {
-				v.Autoscroll = true
 			}
 		}
 	}
@@ -633,7 +346,6 @@ func (v *View) parseInput(ch rune) []cell {
 	isEscape, err := v.ei.parseOne(ch)
 	if err != nil {
 		// there is an error parsing an escape sequence, ouput all the escape characters so far as a string
-		v.log.Warn(string(v.ei.runes()[1:]))
 		for _, r := range v.ei.runes() {
 			c := cell{
 				fgColor: v.FgColor,
@@ -687,24 +399,16 @@ func (v *View) Rewind() {
 	v.readOffset = 0
 }
 
-// draw re-draws the view's contents. It returns an array of wrap counts, that is,
-// when wrapping is turned on, an array where for each index and value i, v,
-// i is the position of a line in the buffer, and v is the number times the line wrapped
-func (v *View) draw() ([]int, error) {
-	v.writeMutex.Lock()
-	defer v.writeMutex.Unlock()
-
+// draw re-draws the view's contents.
+func (v *View) draw() error {
 	maxX, maxY := v.Size()
 
 	if v.Wrap {
 		if maxX == 0 {
-			return nil, errors.New("X size of the view cannot be 0")
+			return errors.New("X size of the view cannot be 0")
 		}
 		v.ox = 0
 	}
-
-	wrapCounts := make([]int, len(v.lines))
-
 	if v.tainted {
 		v.viewLines = nil
 		lines := v.lines
@@ -714,12 +418,10 @@ func (v *View) draw() ([]int, error) {
 		for i, line := range lines {
 			wrap := 0
 			if v.Wrap {
-				// TODO: see if we should consider v.Frame here
-				wrap = maxX + 1
+				wrap = maxX
 			}
 
 			ls := lineWrap(line, wrap)
-			wrapCounts[i] = len(ls) - 1
 			for j := range ls {
 				vline := viewLine{linesX: j, linesY: i, line: ls[j]}
 				v.viewLines = append(v.viewLines, vline)
@@ -759,13 +461,13 @@ func (v *View) draw() ([]int, error) {
 				bgColor = v.BgColor
 			}
 			if err := v.setRune(x, y, c.chr, fgColor, bgColor); err != nil {
-				return nil, err
+				return err
 			}
 			x += runewidth.RuneWidth(c.chr)
 		}
 		y++
 	}
-	return wrapCounts, nil
+	return nil
 }
 
 // realPosition returns the position in the internal buffer corresponding to the
